@@ -1,0 +1,39 @@
+(ns memuse.core
+  (:import java.lang.management.ManagementFactory)
+  (:require [ clojure.core.async :as async :refer [<! >! <!! timeout chan alt!! go close!]]))
+
+
+(def mem-bean (ManagementFactory/getMemoryMXBean))
+
+(defn mem-used []
+  (. mem-bean gc)
+  (-> mem-bean (. getHeapMemoryUsage) (. getUsed)))
+
+(defn foo
+  "I don't do a whole lot."
+  [x]
+  (println x "Hello, World!"))
+
+(def gulping (atom 0))
+
+(defn gulp [m t]
+  (go 
+    (let [_     (swap! gulping inc)
+          large (byte-array m)
+          _     (<! (timeout t))
+          _     (swap! gulping dec)
+          ]
+          (count large)
+      )))
+
+(defn gulps [n m t]
+  (let [cs (doall (for [i (range n)]
+                    (let [c (gulp m t)
+
+                          _ (<!! (timeout (-> t (* (+ 0.1 (rand 0.1))) (int) ) ))
+                          _ (println @gulping (mem-used) )
+                          ]
+                      c)))]
+    (->> cs (map <!!) (reduce +)   )
+    )
+  )
