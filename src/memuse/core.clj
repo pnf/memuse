@@ -1,7 +1,14 @@
 (ns memuse.core
+  (:use (incanter core stats charts io))
   (:import (java.lang.management ManagementFactory MemoryType))
   (:require [ clojure.core.async :as async :refer [<! >! <!! timeout chan alt!! go go-loop  close!]]))
 
+
+(defn mem-used []
+  (let [rt (Runtime/getRuntime)]
+    (- (. rt totalMemory) (. rt freeMemory))
+    )
+)
 
 (def mem-bean (ManagementFactory/getMemoryMXBean))
 
@@ -10,12 +17,13 @@
                          (= (. % getType) MemoryType/HEAP))
                        (ManagementFactory/getMemoryPoolMXBeans)))
 
-(defn mem-used [] (reduce + (map  #(.. % getUsage getUsed) (pools))))
+(defn mem-used-pools [] (reduce + (map  #(.. % getUsage getUsed) (pools))))
 
 
-(defn mem-used2  []
+(defn mem-used-bean  []
   (. mem-bean gc)
   (-> mem-bean (. getHeapMemoryUsage) (. getUsed)))
+
 
 (defn foo
   "I don't do a whole lot."
@@ -53,8 +61,8 @@
   (go-loop [i 0
             r []]
     (if (<= i n)
-      (let [m (mem-used)
-            g @gulping
-            _ (println i g m)
+      (let [m [i @gulping (mem-used) (mem-used-bean) (mem-used-pools)]
+            _ (println m)
             _ (<! (timeout dt))]
-        (recur (inc i) (conj r [i g m]))))))
+        (recur (inc i) (conj r m)))
+      r)))
