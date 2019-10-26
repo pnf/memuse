@@ -40,43 +40,52 @@
   (-> mem-bean (. getHeapMemoryUsage) (. getUsed)))
 
 
-(defn foo
-  "I don't do a whole lot."
-  [x]
-  (println x "Hello, World!"))
-
 (def gulping (atom {}))
 (defn- track! [name dn]
   (let [m2 (swap! gulping (fn [m] (update-in m [name] #(+ dn (if % % 0)))))]
     (get m2 name)))
 
-
+(declare launch)
 (defn gulp
   "Return channel for task name that consume n bytes for up to t ms"
-  [name n t & [debug]]
-  (go 
-    (let [r     (track! name 1)
-          _     (when debug (println "gulp inc" name "->" r))
-          large (byte-array n)
-          _     (<! (timeout (* t (rand))))
-          r     (track! name -1)
-          _     (when debug (println "gulp dec" name "->" r))
-          ]
-          (count large)
-          )))
+  ([launches debug]
+   (when debug (println "Gulping launches" launches))
+   (async/merge (map (fn [l]
+                       (when debug (println "Launching" l))
+                       (apply launch (conj l debug))) launches)))
+  ([name bytes t launches debug]
+   (go 
+     (let [r     (track! name 1)
+           _     (when debug (println "gulp inc" name "->" r))
+           large (byte-array bytes) ;; allocate something big and hold onto it
+           cs    (gulp launches debug)
+           ct    (timeout (* t (rand)))
+           _     (<! (async/merge [ct cs]))
+           r     (track! name -1)
+           _     (when debug (println "gulp dec" name "->" r))
+           ]
+       (count large)
+       ))))
 
 (defn launch
   "Launch l batches of m gulps, each allocating n bytes for up to t milliseconds"
-  [name l m n t & [debug]]
+  [name l m n t subs debug]
+  (when debug (println "launching" name l m n t subs))
   (go-loop [i 0]
     (when (<= i l)
       (let 
           [_  (when debug (println "batch" i "for" name))
-           cs (take m (repeatedly #(gulp name n t debug)))
+           cs (take m (repeatedly #(gulp name n t subs debug)))
            vs (<! (async/map vector cs))]
         (recur (inc i))))))
 
-(defn launch-many [num-sources length-ms max-mem max-batch & [debug]]
+(def launches [[1 2 5 1000000 5000
+                 [[2 1 3 500000 1000 []]
+                  [3 1 4 750000 1500 []]]
+                 ]])
+
+
+(defn launch-rando [num-sources length-ms max-mem max-batch & [debug]]
   (let [argss (take num-sources
                 (repeatedly #(let [t  (inc (rand-int length-ms))
                                    l  (-> (/ length-ms t) int inc)
