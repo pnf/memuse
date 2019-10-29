@@ -79,8 +79,8 @@
            vs (<! (async/map vector cs))]
         (recur (inc i))))))
 
-(def launches [[1 2 5 1000000 5000
-                 [[2 1 3 500000 1000 []]
+(def launches [[1 10 5 1000000 5000
+                 [[2 2 3 500000 1000 []]
                   [3 1 4 750000 1500 []]]
                  ]])
 
@@ -109,40 +109,39 @@
       r)))
 
 (defn m->a [m]
-  (let [ks (-> m first second keys sort)
+  (let [ks (->> m first second keys sort)
         gs (map second m)
-        a  (vec  (map (fn [g] (vec (map #(get g %) ks))) gs))]
+        a  (vec
+            (map (fn [g] (vec (conj  (map #(get g %) ks) 1))) gs))]
     a
     ))
 
-#_(defn m->b [m]
-  (let [ng (-> m first second keys count)]
-    (map #(nth % ng) m))  )
-
 (defn m->b [m] (map #(nth % 2) m))
-
-
-;; icanter matrices are vectors of rows
-(defn col [m i] (map #(nth m i)))
 
 ;; a = \sum_i^M (U_i \cdot b / w_i) V_i
 ;; s_j = \sum_i^M (V_{ji}/w_i)^2
-;;     = 
+;;     =
+;; M   = U   S    V*
+;; mxn  mxm diag nxn
 
-(defn coeffs [{U :U ws :S V :V*} b]
-  (let [Uis (matrix/columns U)
-        Vis (matrix/columns V)
-        M   (matrix/dimension-count U 0)
-        Vjs (matrix/rows  (matrix/submatrix V 0 M 0 M))
+(defn coeffs [a b & [n]]
+  (let [{U :U ws :S V :V*} (if (map? a) a (linear/svd a))
+        M   (matrix/dimension-count ws 0)
+        M   (if n (min M n) M)
+        V   (matrix/transpose V)
+        Uis (take M (matrix/columns U))
+        Vis (take M (matrix/columns V))
+        Vjs (take M (matrix/rows V))
         as (apply matrix/add
            (map (fn [Ui wi Vi]
-                  (matrix/mul (matrix/div (matrix/inner-product Ui b) wi) Vi))
+                  (matrix/mul (matrix/div (matrix/inner-product Ui b) wi)
+                              Vi))
                 Uis ws Vis))
         ss (map (fn [Vj]
                    (let [x (matrix/div Vj ws)]
                      (matrix/inner-product x x)))
                  Vjs)
         ]
-    [as ss]
+    [as ss ws]
    ))
 
