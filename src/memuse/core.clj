@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async :refer [<! >! <!! timeout chan alt!! go go-loop  close!]]
             [clojure.core.matrix :as matrix]
             [clojure.core.matrix.linear :as linear]
+            [clojure.spec.alpha :as s]
             [uncomplicate.neanderthal
              [native :as nn]
              [core :as nc]
@@ -14,7 +15,6 @@
              [charts :as icharts]
              [io :as iio]
              ]
-
             ))
 
 
@@ -40,92 +40,111 @@
   (-> mem-bean (. getHeapMemoryUsage) (. getUsed)))
 
 
-(def gulping (atom {}))
+(def running (atom {}))
 (defn- track! [name dn]
-  (let [m2 (swap! gulping (fn [m] (update-in m [name] #(+ dn (if % % 0)))))]
+  (let [m2 (swap! running (fn [m] (update-in m [name] #(+ dn (if % % 0)))))]
     (get m2 name)))
 
-(declare launch)
-(defn gulp
-  "Return channel for task name that consume n bytes for up to t ms"
-  ([launches debug]
-   (when debug (println "Gulping launches" launches))
-   (async/merge (map (fn [l]
-                       (when debug (println "Launching" l))
-                       (apply launch (conj l debug))) launches)))
-  ([name bytes t launches debug]
-   (go 
-     (let [r     (track! name 1)
-           _     (when debug (println "gulp inc" name "->" r))
-           large (byte-array bytes) ;; allocate something big and hold onto it
-           cs    (gulp launches debug)
-           ct    (timeout (* t (rand)))
-           _     (<! (async/merge [ct cs]))
-           r     (track! name -1)
-           _     (when debug (println "gulp dec" name "->" r))
-           ]
-       (count large)
-       ))))
-
-(defn launch
-  "Launch l batches of m gulps, each allocating n bytes for up to t milliseconds"
-  [name l m n t subs debug]
-  (when debug (println "launching" name l m n t subs))
-  (go-loop [i 0]
-    (when (<= i l)
-      (let 
-          [_  (when debug (println "batch" i "for" name))
-           cs (take m (repeatedly #(gulp name n t subs debug)))
-           vs (<! (async/map vector cs))]
-        (recur (inc i))))))
-
-(def launches [[1 10 5 1000000 5000
-                 [[2 2 3 500000 1000 []]
-                  [3 1 4 750000 1500 []]]
-                 ]])
+(defn make-dict [sub]
+  (let [name (:name sub)]
+    (reduce
+     (fn [dict sub]
+       (if (or (contains? dict (:name sub)) ;; Construct dict from first appearance
+               (not (:t-max sub))           ;; of complete specification
+               )
+         dict 
+         (merge dict (make-dict sub))))
+     {(:name sub) sub}
+     (:subs sub))))
 
 
-(defn launch-rando [num-sources length-ms max-mem max-batch & [debug]]
-  (let [argss (take num-sources
-                (repeatedly #(let [t  (inc (rand-int length-ms))
-                                   l  (-> (/ length-ms t) int inc)
-                                   n  (inc (rand-int max-mem))
-                                   m  (inc (rand-int max-batch))]
-                               [l m n t debug])))
-        cs (map-indexed
-            (fn [i args] (apply launch i args)) argss)
-        c  (async/map vector cs)]
-    [c argss]))
+(defn task
+  "Return channel for task 'name' that consumes n bytes for up to t ms, additionally launching subs,
+  which is a sequence of vectors [task-name num-batches batch-size t-max subs]"
+  ([sub & [debug dict]]
+   (let [dict (or dict (make-dict sub))
+         sub  (if (:t-max sub) sub ;; looks fully-specified
+                  (let
+                      [sub2 (get dict (:name sub))]
+                    (when debug (println "Extending" sub "from " sub2))
+                    (merge sub2 sub)))  ;; flesh out from dictionary
+         {:keys [name num-batches batch-size bytes t-max subs]
+          :or {batch-size 1}} sub]
+     (assert (and t-max (pos? t-max)) (str "Missing :t-max in " sub))
+     (when debug (println "launching" sub))
+     (if num-batches ;; Strip batch info, and launch batches of one-offs
+       (let [t2 (dissoc sub :num-batches :batch-size)]
+         (go-loop [i 0 acc []]
+           (if (<= i num-batches)
+             (let [_  (when debug (println "batch" i "for" name))
+                   cs (doall (take batch-size (repeatedly #(task t2 debug dict))))
+                   vs (<! (async/map vector cs))]
+               (recur (inc i) (conj acc vs)))
+             acc)))
+       (go 
+         (try (let [r     (track! name 1)
+                    _     (when debug (println "task inc" name "->" r))
+                    large (byte-array bytes) ;; allocate something big and hold onto it
+                    cs    (doall (map (fn [s]
+                                        (when debug (println "Launching subtask" (:name s) "from" name))
+                                        (task s debug dict))
+                                      subs))
+                    _     (<! (timeout (* t-max (rand))))
+                    vs    (if (seq cs) (<! (async/map vector cs)) [])
+                    r     (track! name -1)
+                    _     (when debug (println "task dec" name "->" r))
+                    ]
+                [(count large) vs])
+              (catch Exception e (do (println "Lordy be!" e) "boffo"))  )  )))))
+
+(def tasks1 {:name 1 :num-batches 1 :batch-size 2 :bytes 1024 :t-max 100 :debug true
+             :subs [{:name 2 :num-batches 1 :batch-size 1 :bytes 1024 :t-max 100} {:name 2 :batch-size 2}]
+             })
 
 
-(defn measure [n dt]
+(def tasks2 {:name 1 :num-batches 3 :batch-size 2 :bytes 1024 :t-max 100
+            :subs [{:name 2 :num-batches 2 :batch-size 2 :bytes 2000000 :t-max 1000}
+                   {:name 3 :num-batches 1 :batch-size 3 :bytes 5000000 :t-max 2000
+                    :subs [{:name 2 :num-batches 3 :batch-size 10}]
+                    }]
+            })
+
+(defn measure [n dt task-chan]
   (go-loop [i 0
             r []]
-    (if (<= i n)
-      (let [m [i @gulping (mem-used) (mem-used-bean) (mem-used-pools)]
-            _ (println m)
-            _ (<! (timeout dt))]
-        (recur (inc i) (conj r m)))
-      r)))
+    (let
+        [tr (async/poll! task-chan)]
+      (cond
+        (and (<= i n) (not tr)) ;; no limit, no result
+        (let [m [i @running (mem-used) (mem-used-bean) (mem-used-pools)]
+              _ (println m)
+              _ (<! (timeout dt))]
+          (recur (inc i) (conj r m)))
+        (not tr) ;; hit limit, no result
+        [r task-chan]
+        :else ;; ready!
+        [r tr]))))
 
 (defn m->a [m]
-  (let [ks (->> m first second keys sort)
+  (let [ks (->> m last second keys sort)
         gs (map second m)
         a  (vec
-            (map (fn [g] (vec (conj  (map #(get g %) ks) 1))) gs))]
+            (map (fn [g] (vec (conj  (map #(or (get g %) 0) ks) 1))) gs))]
     a
     ))
 
-(defn m->b [m] (map #(nth % 2) m))
+(defn m->b [m] (map #(nth % 3) m))
 
 ;; a = \sum_i^M (U_i \cdot b / w_i) V_i
 ;; s_j = \sum_i^M (V_{ji}/w_i)^2
 ;;     =
 ;; M   = U   S    V*
-;; mxn  mxm diag nxn
+;; nxm  nxn diag mxm
 
-(defn coeffs [a b & [n]]
-  (let [{U :U ws :S V :V*} (if (map? a) a (linear/svd a))
+(defn coeffs [m & [n]]
+  (let [a   (m->a m)
+        b   (m->b m)
+        {U :U ws :S V :V*} (if (map? a) a (linear/svd a))
         M   (matrix/dimension-count ws 0)
         M   (if n (min M n) M)
         V   (matrix/transpose V)
@@ -142,6 +161,6 @@
                      (matrix/inner-product x x)))
                  Vjs)
         ]
-    [as ss ws]
+    [as ss ws V]
    ))
 
