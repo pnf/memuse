@@ -4,11 +4,8 @@
             [clojure.core.matrix :as matrix]
             [clojure.core.matrix.linear :as linear]
             [clojure.spec.alpha :as s]
-            [uncomplicate.neanderthal
-             [native :as nn]
-             [core :as nc]
-             [linalg :as nl]
-             ]
+            [clojure.set :as set]
+            ;;[uncomplicate.neanderthal [native :as nn] [core :as nc] [linalg :as nl]]
             [incanter
              [core :as icore]
              [stats :as istat]
@@ -102,14 +99,60 @@
              })
 
 
-(def tasks2 {:name 1 :num-batches 3 :batch-size 2 :bytes 1024 :t-max 100
+(def tasks2 {:name 1 :num-batches 5 :batch-size 5 :bytes 1024 :t-max 100
             :subs [{:name 2 :num-batches 2 :batch-size 2 :bytes 2000000 :t-max 1000}
                    {:name 3 :num-batches 1 :batch-size 3 :bytes 5000000 :t-max 2000
                     :subs [{:name 2 :num-batches 3 :batch-size 10}]
                     }]
-            })
+             })
 
-(defn measure [n dt task-chan]
+(defn taskgen [& {:keys [pNew     newMax    newMin   pStop     byteMax         batchMax   tmaxMax      maxSubs   debug]
+                  :or   {pNew 0.3 newMax 10 newMin 5 pStop 0.5 byteMax 1000000 batchMax 5 tmaxMax 3000 maxSubs 4 debug false}}]
+  (letfn
+      [(child [idMax id->desc lineage] ;; -> [idMax id->desc child]
+         (let [_ (when debug (println "(child" idMax id->desc lineage))
+               available (set/difference (set (range 1 (inc idMax))) lineage)]
+           ;; Re-use tasks not in our path, min and max number of tasks
+           (if (and (pos? (count available)) (>= idMax newMin) (or (>= idMax newMax) (> (rand) pNew)))
+             [idMax id->desc (rand-nth (vec available))]
+             ;; Otherwise create a new routine
+             (let [id           (inc idMax)
+                   idMax        id
+                   lineage      (conj lineage id)
+                   [idMax id->desc desc subs] (if (and (>= id newMin)
+                                                       (or (< (rand) pStop) (> id newMax)))
+                                                [idMax id->desc 0  []] ;; no new children
+                                                ;; create new children, keeping track of idMax and id->desc
+                                                (loop [i (inc (rand-int maxSubs))
+                                                       id->desc id->desc
+                                                       desc 1
+                                                       idMax idMax
+                                                       subs  []]
+                                                  (println "loop" i id->desc idMax subs) 
+                                                  (if (zero? i)
+                                                    [idMax id->desc desc subs]
+                                                    (let [[idMax id->desc c] (child idMax id->desc lineage)
+                                                          cid   (if (map? c) (:name c) c)
+                                                          _ (when debug (println "Sub" i ":" cid c))
+                                                          desc (+ desc (get id->desc cid))]
+                                                      (recur (dec i) id->desc desc idMax (conj subs c))))))
+                   _ (when debug (println "New" id "<=" idMax id->desc))
+                   id->desc  (assoc id->desc id desc)]
+               [idMax
+                id->desc
+                {:name id
+                 :num-batches 1
+                 :batch-size (inc (rand-int batchMax))
+                 :bytes (inc (rand-int byteMax))
+                 :t-max (inc (rand-int tmaxMax))
+                 :subs subs
+                 }]))))]
+      (last (child 0 {} #{})))
+  )
+
+
+(defn measure [n dt task-chan & [debug]]
+  (System/gc)
   (go-loop [i 0
             r []]
     (let
@@ -117,7 +160,7 @@
       (cond
         (and (<= i n) (not tr)) ;; no limit, no result
         (let [m [i @running (mem-used) (mem-used-bean) (mem-used-pools)]
-              _ (println m)
+              _ (when debug (println m))
               _ (<! (timeout dt))]
           (recur (inc i) (conj r m)))
         (not tr) ;; hit limit, no result
@@ -144,7 +187,7 @@
 (defn coeffs [m & [n]]
   (let [a   (m->a m)
         b   (m->b m)
-        {U :U ws :S V :V*} (if (map? a) a (linear/svd a))
+        {U :U ws :S V :V*} (linear/svd a)
         M   (matrix/dimension-count ws 0)
         M   (if n (min M n) M)
         V   (matrix/transpose V)
