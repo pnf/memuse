@@ -15,105 +15,131 @@
             ))
 
 
-
+;; Boring: get memory use straight from runtime
 (defn mem-used []
   (let [rt (Runtime/getRuntime)]
-    (- (. rt totalMemory) (. rt freeMemory))
-    )
-)
+       (- (. rt totalMemory) (. rt freeMemory))))
 
+
+;; Heap usage from (single) MemoryMxBean
 (def mem-bean (ManagementFactory/getMemoryMXBean))
-
-(defn pools [] (filter #(and
-                         (. % isValid)
-                         (= (. % getType) MemoryType/HEAP))
-                       (ManagementFactory/getMemoryPoolMXBeans)))
-
-(defn mem-used-pools [] (reduce + (map  #(.. % getUsage getUsed) (pools))))
-
-
 (defn mem-used-bean  []
   (. mem-bean gc)
   (-> mem-bean (. getHeapMemoryUsage) (. getUsed)))
 
+;; Sum memory usage across all heap pools
+(defn- pools [] (filter #(and
+                         (. % isValid)
+                         (= (. % getType) MemoryType/HEAP))
+                       (ManagementFactory/getMemoryPoolMXBeans)))
+(defn mem-used-pools [] (reduce + (map  #(.. % getUsage getUsed) (pools))))
 
-(def running (atom {}))
+;; Keep track of population of each type of task currently running
+(def running (atom {})) ;; name -> count
 (defn- track! [name dn]
   (let [m2 (swap! running (fn [m] (update-in m [name] #(+ dn (if % % 0)))))]
     (get m2 name)))
 
-(defn make-dict [sub]
-  (let [name (:name sub)]
-    (reduce
-     (fn [dict sub]
-       (if (or (contains? dict (:name sub)) ;; Construct dict from first appearance
-               (not (:t-max sub))           ;; of complete specification
-               )
-         dict 
-         (merge dict (make-dict sub))))
-     {(:name sub) sub}
-     (:subs sub))))
+(defn summary [sub]
+  (into {} (map (fn [[name sub]]
+                  [name [(::bytes sub) (map #(if (map? %) (::name %) %) (::subs sub))]])
+                (make-dict sub))))
+
+(s/def ::name (s/or :num int? :str string?))
+(s/def ::num-batches int?)
+(s/def ::batch-size int?)
+(s/def ::bytes int?)
+(s/def ::t-max int?)
+(s/def ::subs (s/coll-of ::task-ref :kind vector?))
+(s/def ::task (s/keys :req [::name ::t-max ::num-batches ::batch-size]
+                      :opt [::debug ::subs]))
+(s/def ::task-ref (s/or :ref (s/keys :req [::name]
+                                     :opt [::num-batches ::batch-size ::debug])
+                        :mini ::name
+                        :def ::task))
+
+;; Given a task launch specification, assemble dictionary of name -> task
+(defn make-dict [task]
+  (let [_    (assert (s/valid? ::task task) (s/explain ::task task))
+        dict (letfn [(md [task]
+                        (reduce (fn [dict task]
+                                  (if-not (::t-max task) ;; complete specification
+                                    dict
+                                    (merge dict (make-dict task))))
+                                {(::name task) task}
+                                (::subs task)))]
+                (md task))
+        _    (letfn [(check [task]
+                       (let [name (if (map? task) (::name task) task)]
+                         (assert (contains? dict name) (str "Missing" name "in dict"))
+                         (doseq [t (::subs task)] (check t))))])]
+    dict))
 
 
-(defn task
+;; Emergency brake
+(def continue (atom true))
+
+(defn launch
   "Return channel for task 'name' that consumes n bytes for up to t ms, additionally launching subs,
-  which is a sequence of vectors [task-name num-batches batch-size t-max subs]"
-  ([sub & [debug dict]]
-   (let [dict (or dict (make-dict sub))
-         sub  (if (:t-max sub) sub ;; looks fully-specified
-                  (let
-                      [sub2 (get dict (:name sub))]
-                    (when debug (println "Extending" sub "from " sub2))
-                    (merge sub2 sub)))  ;; flesh out from dictionary
-         {:keys [name num-batches batch-size bytes t-max subs]
-          :or {batch-size 1}} sub]
-     (assert (and t-max (pos? t-max)) (str "Missing :t-max in " sub))
-     (when debug (println "launching" sub))
-     (if num-batches ;; Strip batch info, and launch batches of one-offs
-       (let [t2 (dissoc sub :num-batches :batch-size)]
-         (go-loop [i 0 acc []]
-           (if (<= i num-batches)
-             (let [_  (when debug (println "batch" i "for" name))
-                   cs (doall (take batch-size (repeatedly #(task t2 debug dict))))
-                   vs (<! (async/map vector cs))]
-               (recur (inc i) (conj acc vs)))
-             acc)))
-       (go 
-         (try (let [r     (track! name 1)
-                    _     (when debug (println "task inc" name "->" r))
-                    large (byte-array bytes) ;; allocate something big and hold onto it
-                    cs    (doall (map (fn [s]
-                                        (when debug (println "Launching subtask" (:name s) "from" name))
-                                        (task s debug dict))
-                                      subs))
-                    _     (<! (timeout (* t-max (rand))))
-                    vs    (if (seq cs) (<! (async/map vector cs)) [])
-                    r     (track! name -1)
-                    _     (when debug (println "task dec" name "->" r))
-                    ]
-                [(count large) vs])
-              (catch Exception e (do (println "Lordy be!" e) "boffo"))  )  )))))
+  which is a sequence of vectors [task-name num-batches batch-size
+  t-max subs]"
+  [task0 & [debug dict]]
+  (when @continue
+    (let [dict (or dict (make-dict task0))
+          task task0
+          tasks (cond
+                (not (map? tasks)) (get dict tasks)
+                (::t-max tasks)    tasks
+                :else            (merge (get dict (::name tasks)) tasks))
+          {:keys [::name ::num-batches ::batch-size ::bytes ::t-max ::subs]
+           :or {batch-size 1}} tasks]
+      (when debug (println "launching" tasks))
+      (if num-batches ;; Strip batch info, and launch batches of one-offs
+        (let [t2 (dissoc tasks ::num-batches ::batch-size)]
+          (go-loop [i 0 acc []]
+            (if (<= i num-batches)
+              (let [_  (when debug (println "batch" i "for" name))
+                    cs (doall (take batch-size (repeatedly #(launch t2 debug dict))))
+                    vs (<! (async/map vector cs))]
+                (recur (inc i) (conj acc vs)))
+              acc)))
+        (go 
+          (try (let [r     (track! name 1)
+                     _     (when debug (println "task inc" name "->" r))
+                     large (byte-array bytes) ;; allocate something big and hold onto it
+                     cs    (doall (map (fn [s]
+                                         (when debug (println "Launching subtask" (::name s) "from" name))
+                                         (launch s debug dict))
+                                       subs))
+                     _     (<! (timeout (* t-max (rand))))
+                     vs    (if (seq cs) (<! (async/map vector cs)) [])
+                     r     (track! name -1)
+                     _     (when debug (println "task dec" name "->" r))
+                     ]
+                 [(count large) vs])
+               (catch Exception e (do (println "Lordy be!" e) "boffo") (reset! continue false))))))))
 
-(def tasks1 {:name 1 :num-batches 1 :batch-size 2 :bytes 1024 :t-max 100 :debug true
-             :subs [{:name 2 :num-batches 1 :batch-size 1 :bytes 1024 :t-max 100} {:name 2 :batch-size 2}]
+(def tasks1 {::name 1 ::num-batches 1 ::batch-size 2 ::bytes 1024 ::t-max 100 ::debug true
+             ::subs [{::name 2 ::num-batches 1 ::batch-size 1 ::bytes 1024 ::t-max 100} 2]
              })
 
 
-(def tasks2 {:name 1 :num-batches 5 :batch-size 5 :bytes 1024 :t-max 100
-            :subs [{:name 2 :num-batches 2 :batch-size 2 :bytes 2000000 :t-max 1000}
-                   {:name 3 :num-batches 1 :batch-size 3 :bytes 5000000 :t-max 2000
-                    :subs [{:name 2 :num-batches 3 :batch-size 10}]
+(def tasks2 {::name 1 ::num-batches 5 ::batch-size 5 ::bytes 1024 ::t-max 100
+            ::subs [{::name 2 ::num-batches 2 ::batch-size 2 ::bytes 2000000 ::t-max 1000}
+                   {::name 3 ::num-batches 1 ::batch-size 3 ::bytes 5000000 ::t-max 2000
+                    ::subs [{::name 2 ::num-batches 3 ::batch-size 10}]
                     }]
              })
 
+
 (defn taskgen [& {:keys [pNew     newMax    newMin   pStop     byteMax         batchMax   tmaxMax      maxSubs   debug]
-                  :or   {pNew 0.3 newMax 10 newMin 5 pStop 0.5 byteMax 1000000 batchMax 5 tmaxMax 3000 maxSubs 4 debug false}}]
+                  :or   {pNew 0.3 newMax 10 newMin 5 pStop 0.5 byteMax 10000000 batchMax 5 tmaxMax 3000 maxSubs 4 debug false}}]
   (letfn
       [(child [idMax id->desc lineage] ;; -> [idMax id->desc child]
          (let [_ (when debug (println "(child" idMax id->desc lineage))
                available (set/difference (set (range 1 (inc idMax))) lineage)]
            ;; Re-use tasks not in our path, min and max number of tasks
-           (if (and (pos? (count available)) (>= idMax newMin) (or (>= idMax newMax) (> (rand) pNew)))
+           (if (and (pos? (count available)) (or (>= idMax newMax) (> (rand) pNew)))
              [idMax id->desc (rand-nth (vec available))]
              ;; Otherwise create a new routine
              (let [id           (inc idMax)
@@ -128,11 +154,11 @@
                                                        desc 1
                                                        idMax idMax
                                                        subs  []]
-                                                  (println "loop" i id->desc idMax subs) 
+                                                  (when debug (println "loop" i id->desc idMax subs)) 
                                                   (if (zero? i)
                                                     [idMax id->desc desc subs]
                                                     (let [[idMax id->desc c] (child idMax id->desc lineage)
-                                                          cid   (if (map? c) (:name c) c)
+                                                          cid   (if (map? c) (::name c) c)
                                                           _ (when debug (println "Sub" i ":" cid c))
                                                           desc (+ desc (get id->desc cid))]
                                                       (recur (dec i) id->desc desc idMax (conj subs c))))))
@@ -140,12 +166,12 @@
                    id->desc  (assoc id->desc id desc)]
                [idMax
                 id->desc
-                {:name id
-                 :num-batches 1
-                 :batch-size (inc (rand-int batchMax))
-                 :bytes (inc (rand-int byteMax))
-                 :t-max (inc (rand-int tmaxMax))
-                 :subs subs
+                {::name id
+                 ::num-batches 1
+                 ::batch-size (inc (rand-int batchMax))
+                 ::bytes (inc (rand-int byteMax))
+                 ::t-max (inc (rand-int tmaxMax))
+                 ::subs subs
                  }]))))]
       (last (child 0 {} #{})))
   )
