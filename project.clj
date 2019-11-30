@@ -18,6 +18,7 @@
   ;; :java-cmd "/Users/pnf/dist/jdk-12.0.2+10/Contents/Home/bin/java"
   ;; :java-cmd "/home/pnf/dist/jdk-12.0.2+10/bin/java"
   :java-cmd "/home/pnf/dist/graalvm-ce-19.2.1/bin/java"
+  :jvm-opts ["-Xmx10g"]
   ;; :jvm-opts ["-Xgc:concurrentScavenge" ]
   ;; "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED"
   ;; :plugins [[lein-with-env-vars "0.2.0"]]
