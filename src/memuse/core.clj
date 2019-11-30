@@ -18,32 +18,28 @@
 ;; Boring: get memory use straight from runtime
 (defn mem-used []
   (let [rt (Runtime/getRuntime)]
-       (- (. rt totalMemory) (. rt freeMemory))))
+       (- (.totalMemory rt) (.freeMemory rt))))
 
 
 ;; Heap usage from (single) MemoryMxBean
 (def mem-bean (ManagementFactory/getMemoryMXBean))
 (defn mem-used-bean  []
-  (. mem-bean gc)
+  (.gc mem-bean)
   (-> mem-bean (. getHeapMemoryUsage) (. getUsed)))
 
 ;; Sum memory usage across all heap pools
 (defn- pools [] (filter #(and
-                         (. % isValid)
-                         (= (. % getType) MemoryType/HEAP))
+                         (.isValid %)
+                         (= (.getType %) MemoryType/HEAP))
                        (ManagementFactory/getMemoryPoolMXBeans)))
 (defn mem-used-pools [] (reduce + (map  #(.. % getUsage getUsed) (pools))))
 
 ;; Keep track of population of each type of task currently running
 (def running (atom {})) ;; name -> count
 (defn- track! [name dn]
-  (let [m2 (swap! running (fn [m] (update-in m [name] #(+ dn (if % % 0)))))]
+  (let [m2 (swap! running (fn [m] (update-in m [name] #(+ dn (or % 0)))))]
     (get m2 name)))
 
-(defn summary [sub]
-  (into {} (map (fn [[name sub]]
-                  [name [(::bytes sub) (map #(if (map? %) (::name %) %) (::subs sub))]])
-                (make-dict sub))))
 
 (s/def ::name (s/or :num int? :str string?))
 (s/def ::num-batches int?)
@@ -72,9 +68,14 @@
         _    (letfn [(check [task]
                        (let [name (if (map? task) (::name task) task)]
                          (assert (contains? dict name) (str "Missing" name "in dict"))
-                         (doseq [t (::subs task)] (check t))))])]
+                         (doseq [t (::subs task)] (check t))))] nil)]
     dict))
 
+
+(defn summary [sub]
+  (into (sorted-map) (map (fn [[name sub]]
+                  [name [(/ (::bytes sub) 1.0e6) (/ (::t-max sub) 1.0e3) (map #(if (map? %) (::name %) %) (::subs sub))]])
+                (make-dict sub))))
 
 ;; Emergency brake
 (def continue (atom true))
@@ -85,12 +86,15 @@
   t-max subs]"
   [task0 & [debug dict]]
   (when @continue
-    (let [dict (or dict (make-dict task0))
+    (let [dict (or dict (do
+                          (reset! continue true)
+                          (reset! running {})
+                          (make-dict task0)))
           task task0
           tasks (cond
-                (not (map? tasks)) (get dict tasks)
-                (::t-max tasks)    tasks
-                :else            (merge (get dict (::name tasks)) tasks))
+                (not (map? task)) (get dict task)
+                (::t-max task)    task
+                :else            (merge (get dict (::name task)) task))
           {:keys [::name ::num-batches ::batch-size ::bytes ::t-max ::subs]
            :or {batch-size 1}} tasks]
       (when debug (println "launching" tasks))
@@ -99,7 +103,7 @@
           (go-loop [i 0 acc []]
             (if (<= i num-batches)
               (let [_  (when debug (println "batch" i "for" name))
-                    cs (doall (take batch-size (repeatedly #(launch t2 debug dict))))
+                    cs (doall (repeatedly batch-size #(launch t2 debug dict)))
                     vs (<! (async/map vector cs))]
                 (recur (inc i) (conj acc vs)))
               acc)))
@@ -117,7 +121,7 @@
                      _     (when debug (println "task dec" name "->" r))
                      ]
                  [(count large) vs])
-               (catch Exception e (do (println "Lordy be!" e) "boffo") (reset! continue false))))))))
+               (catch Exception e (do (println "Lordy be!" e) (reset! continue false)))))))))
 
 (def tasks1 {::name 1 ::num-batches 1 ::batch-size 2 ::bytes 1024 ::t-max 100 ::debug true
              ::subs [{::name 2 ::num-batches 1 ::batch-size 1 ::bytes 1024 ::t-max 100} 2]
@@ -220,16 +224,18 @@
         Uis (take M (matrix/columns U))
         Vis (take M (matrix/columns V))
         Vjs (take M (matrix/rows V))
+        wws (map #(if (< % 0.0001) 0.0 (/ %)) ws)
         as (apply matrix/add
            (map (fn [Ui wi Vi]
-                  (matrix/mul (matrix/div (matrix/inner-product Ui b) wi)
-                              Vi))
-                Uis ws Vis))
+                  (matrix/mul (matrix/inner-product Ui b) wi Vi))
+                Uis wws Vis))
+        as (map #(/ % 1.0e6) as)
         ss (map (fn [Vj]
-                   (let [x (matrix/div Vj ws)]
-                     (matrix/inner-product x x)))
-                 Vjs)
+                  (let [x (matrix/mul Vj wws 1.0e-3)
+                        dp (matrix/inner-product x x)]
+                    (matrix/sqrt dp)))
+                Vjs)
         ]
-    [as ss ws V]
+    [as ss ws]
    ))
 
