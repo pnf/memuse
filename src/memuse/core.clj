@@ -146,6 +146,7 @@
 
 
 (defn summary [sub]
+  "For each task, show [MB, sec, [subs]]"
   (into (sorted-map) (map (fn [[name sub]]
                   [name [(/ (::bytes sub) 1.0e6) (/ (::t-max sub) 1.0e3) (map #(if (map? %) (::name %) %) (::subs sub))]])
                 (make-dict sub))))
@@ -325,3 +326,17 @@
     [as ss ws]
    ))
 
+
+#_(
+
+   ;; Experiment with multiple n tasks running at a time
+   (def specs (make-specs 5 2000 0 10000000 0 false))
+   (def x (<!! (measure 100 500 (juggle 5 (task-source 400 specs)) true)))
+   (coeffs (first x))
+
+   ;; Experiment with complicated nesting
+   (def tasks (taskgen :debug false :pNew 0.8 :newMin 3 :newMax 10))
+   (summary tasks)
+   (def x (<!! (measure 1000 250 (launch tasks false) true)))   
+
+   )
