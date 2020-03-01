@@ -10,8 +10,8 @@
              [core :as icore]
              [stats :as istat]
              [charts :as icharts]
-             [io :as iio]
-             ]
+             [io :as iio]]
+            [clojure.core.strint :refer [<<]]
             ))
 
 
@@ -40,6 +40,77 @@
   (let [m2 (swap! running (fn [m] (update-in m [name] #(+ dn (or % 0)))))]
     (get m2 name)))
 
+;; Emergency brake
+(def continue (atom true))
+
+(defn juggle
+  "Keep n tasks running, where task-fn-chan is a channel that delivers
+   functions that deliver a task channel."
+  [n task-fn-chan & [debug]]
+  (reset! running {})
+  (go-loop [m     0
+            tfc   task-fn-chan
+            tasks #{}]
+    (when debug (println (<< "juggling m=~{m} tasks=~(count tasks)")))
+    (cond
+      (not @continue)
+      (do 
+        (println "Aborting!!!!")
+        m)
+      ;; done
+      (and (nil? tfc) (empty? tasks)) m
+      ;; need to drain
+      (or (nil? tfc) (>= (count tasks) n))
+      (let [_ (when debug (println "alts" (count tasks)))
+            [_ task] (async/alts! (seq tasks))]
+        (recur (inc m) tfc (disj tasks task )))
+      :else
+      ;; get more tasks
+      (if-let [tf (<! tfc)]
+        (let [_ (when debug (println "Evaluating" tf))
+              t (tf)]
+          (when debug (println "Added task " t))
+          (recur m tfc (conj tasks t)))
+        (recur m nil tasks)))))
+
+(defn start-task
+  "Start a task that will run for some time between tMin and tMax,
+  consuming between bMin and bMax bytes."
+  [id tMin tMax bMin bMax & [debug]]
+  (let [t (+ tMin (int (rand (- tMax tMin))))
+        b (+ bMin (int (rand (- bMax bMin))))]
+    (go
+      (let [ds (<< "~{id} t=~{t} b=~{b}")
+            _  (when debug (println "Starting " ds))
+            _  (track! id 1)
+            bs (byte-array b)]
+        (<! (timeout t))
+        (track! id -1)
+        (when debug (println "Finished " ds))
+        id))))
+
+
+(defn make-specs [n tMax dt bMax db & [debug]]
+  (map (fn [i]
+         (let [id (inc i)
+               tMin (int (- (rand tMax) (/ dt 2)))
+               tMax (int (+ tMin dt))
+               bMin (int (- (rand bMax) (/ db 2)))
+               bMax (int (+ bMin db))]
+           [id tMin tMax bMin bMax debug]))
+       (range n)))
+
+
+(defn task-source [n task-specs]
+  (let [c (chan)]
+    (go-loop [i n]
+      (if (pos? i)
+        (do (async/>! c (fn [] (apply start-task (rand-nth task-specs))))
+            (recur (dec i)))
+        (close! c)))
+    c))
+
+
 
 (s/def ::name (s/or :num int? :str string?))
 (s/def ::num-batches int?)
@@ -49,10 +120,12 @@
 (s/def ::subs (s/coll-of ::task-ref :kind vector?))
 (s/def ::task (s/keys :req [::name ::t-max ::num-batches ::batch-size]
                       :opt [::debug ::subs]))
-(s/def ::task-ref (s/or :ref (s/keys :req [::name]
+(s/def ::task-ref (s/or
+                   :ref (s/keys :req [::name]
                                      :opt [::num-batches ::batch-size ::debug])
-                        :mini ::name
-                        :def ::task))
+                   :rando (s/coll-of ::name) ;; randomly pick a range
+                   :mini ::name
+                   :def ::task))
 
 ;; Given a task launch specification, assemble dictionary of name -> task
 (defn make-dict [task]
@@ -77,8 +150,6 @@
                   [name [(/ (::bytes sub) 1.0e6) (/ (::t-max sub) 1.0e3) (map #(if (map? %) (::name %) %) (::subs sub))]])
                 (make-dict sub))))
 
-;; Emergency brake
-(def continue (atom true))
 
 (defn launch
   "Return channel for task 'name' that consumes n bytes for up to t ms, additionally launching subs,
@@ -93,12 +164,13 @@
           task task0
           tasks (cond
                 (not (map? task)) (get dict task)
-                (::t-max task)    task
+                (::t-max task)    task  ;; presence of t-max is takenyo mean it's complete
                 :else            (merge (get dict (::name task)) task))
           {:keys [::name ::num-batches ::batch-size ::bytes ::t-max ::subs]
            :or {batch-size 1}} tasks]
       (when debug (println "launching" tasks))
-      (if num-batches ;; Strip batch info, and launch batches of one-offs
+      (if num-batches
+        ;; Strip batch info, and launch batches of one-offs
         (let [t2 (dissoc tasks ::num-batches ::batch-size)]
           (go-loop [i 0 acc []]
             (if (<= i num-batches)
@@ -107,6 +179,7 @@
                     vs (<! (async/map vector cs))]
                 (recur (inc i) (conj acc vs)))
               acc)))
+        ;; Launch the task
         (go 
           (try (let [r     (track! name 1)
                      _     (when debug (println "task inc" name "->" r))
@@ -135,9 +208,22 @@
                     }]
              })
 
+(defn flat [nSubs nBatches byteMax tMax]
+  {::name 1 ::num-batches 1 ::t-max 10 ::bytes 10 ::batch-size 1
+   ::subs (vec (map
+                (fn [i]
+                  {::name i
+                   ::num-batches nBatches
+                   ::batch-size 1
+                   ::t-max tMax
+                   ::bytes (int (rand byteMax))})
+                (range 2 (+ nSubs 2))
+                ))
+   })
 
-(defn taskgen [& {:keys [pNew     newMax    newMin   pStop     byteMax         batchMax   tmaxMax      maxSubs   debug]
-                  :or   {pNew 0.3 newMax 10 newMin 5 pStop 0.5 byteMax 10000000 batchMax 5 tmaxMax 3000 maxSubs 4 debug false}}]
+
+(defn taskgen [& {:keys [pNew     newMax    newMin   pStop     byteMax         batchMax   tmaxMax      maxSubs   debug       depthMax]
+                  :or   {pNew 0.3 newMax 10 newMin 5 pStop 0.5 byteMax 1000000 batchMax 5 tmaxMax 3000 maxSubs 4 debug false depthMax 1}}]
   (letfn
       [(child [idMax id->desc lineage] ;; -> [idMax id->desc child]
          (let [_ (when debug (println "(child" idMax id->desc lineage))
