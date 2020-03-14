@@ -19,9 +19,10 @@
   ;; :java-cmd "/home/pnf/dist/jdk-12.0.2+10/bin/java"
   ;; :java-cmd "/home/pnf/dist/graalvm-ce-19.2.1/bin/java"
   ;; java-cmd "/Users/pnf/dist/jdk-13.0.2+8/Contents/Home/bin/java"  ;; openjdk not built with graal yet!
-  java-cmd "/Users/pnf/dist/graalvm-ce-java11-20.0.0/Contents/Home/bin/java" ;; graal enabled by default
-  :jvm-opts ["-Xmx10g" ;;"-XX:+UnlockExperimentalVMOptions" "-XX:+EnableJVMCI"
-             ]
+  ;; :java-cmd "/Users/pnf/dist/graalvm-ce-java11-20.0.0/Contents/Home/bin/java" ;; graal enabled by default
+  ;; :jvm-opts ["-Xmx10g"]
+  :java-cmd "/Users/pnf/dist/jdk-11.0.6+10/Contents/Home/bin/java"
+  :jvm-opts ["-Xmx10g" "-XX:+UnlockExperimentalVMOptions" "-XX:+EnableJVMCI"]
   ;; :jvm-opts ["-Xgc:concurrentScavenge" ]
   ;; "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED"
   ;; :plugins [[lein-with-env-vars "0.2.0"]]

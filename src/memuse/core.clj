@@ -1,5 +1,6 @@
 (ns memuse.core
-  (:import (java.lang.management ManagementFactory MemoryType))
+  (:import (java.lang.management ManagementFactory MemoryType)
+           (java.lang ProcessHandle))
   (:require [clojure.core.async :as async :refer [<! >! <!! timeout chan alt!! go go-loop  close!]]
             [clojure.core.matrix :as matrix]
             [clojure.core.matrix.linear :as linear]
@@ -330,7 +331,15 @@
 #_(
 
    ;; Experiment with multiple n tasks running at a time
+
+   ;; Start repl manually to catch weird exceptions
+   
    (def specs (make-specs 5 2000 0 10000000 0 false))
+   ([1 333 333 886132 886132 false]
+ [2 391 391 1511731 1511731 false]
+ [3 250 250 9679605 9679605 false]
+ [4 1561 1561 1674867 1674867 false]
+ [5 1281 1281 6438106 6438106 false])
    (def x (<!! (measure 100 500 (juggle 5 (task-source 400 specs)) true)))
    (coeffs (first x))
 
