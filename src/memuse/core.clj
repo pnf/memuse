@@ -17,9 +17,13 @@
 
 
 ;; Boring: get memory use straight from runtime
+;; This seems to reflect only allocations, until either gc or
+;; a bean method is executed.
 (defn mem-used []
   (let [rt (Runtime/getRuntime)]
-       (- (.totalMemory rt) (.freeMemory rt))))
+    (- (.totalMemory rt) (.freeMemory rt))))
+
+(def gc-beans (ManagementFactory/getGarbageCollectorMXBeans))
 
 
 ;; Heap usage from (single) MemoryMxBean
@@ -43,6 +47,31 @@
 
 ;; Emergency brake
 (def continue (atom true))
+
+(defn start-task
+  "Start a task that will run for some time between tMin and tMax,
+  consuming between bMin and bMax bytes."
+  [id tMin tMax bMin bMax & [debug]]
+  (let [t (+ tMin (int (rand (- tMax tMin))))
+        b (+ bMin (int (rand (- bMax bMin))))]
+    (go
+      (let [ds (<< "~{id} t=~{t} b=~{b}")
+            _  (when debug (println "Starting " ds))
+            _  (track! id 1)
+            bs (byte-array b)]
+        (<! (timeout t))
+        (track! id -1)
+        (when debug (println "Finished " ds))
+        id))))
+
+(defn pulse
+  "Wait pre-delay ms, allocate bytes, hold for length-ms, then post-delay "
+  [pre-delay bytes length post-delay & [debug]]
+  (go
+    (let [_ (<! (timeout pre-delay))
+          _ (<! (start-task 1 length length bytes bytes debug))
+          _ (<! (timeout post-delay))]
+      "done")))
 
 (defn juggle
   "Keep n tasks running, where task-fn-chan is a channel that delivers
@@ -73,22 +102,6 @@
           (when debug (println "Added task " t))
           (recur m tfc (conj tasks t)))
         (recur m nil tasks)))))
-
-(defn start-task
-  "Start a task that will run for some time between tMin and tMax,
-  consuming between bMin and bMax bytes."
-  [id tMin tMax bMin bMax & [debug]]
-  (let [t (+ tMin (int (rand (- tMax tMin))))
-        b (+ bMin (int (rand (- bMax bMin))))]
-    (go
-      (let [ds (<< "~{id} t=~{t} b=~{b}")
-            _  (when debug (println "Starting " ds))
-            _  (track! id 1)
-            bs (byte-array b)]
-        (<! (timeout t))
-        (track! id -1)
-        (when debug (println "Finished " ds))
-        id))))
 
 
 (defn make-specs [n tMax dt bMax db & [debug]]
@@ -269,20 +282,24 @@
   )
 
 
-(defn measure [n dt task-chan & [debug]]
+
+(defn measure
+  "Take at most n measurements, dt ms apart; if result-chan returns an result, stop
+  and return it."
+  [n dt result-chan & [debug]]
   (System/gc)
   (go-loop [i 0
             r []]
     (let
-        [tr (async/poll! task-chan)]
+        [tr (async/poll! result-chan)]
       (cond
         (and (<= i n) (not tr)) ;; no limit, no result
-        (let [m [i @running (mem-used) (mem-used-bean) (mem-used-pools)]
+        (let [m [i @running (mem-used-bean) (mem-used) (map #(.getCollectionCount %) gc-beans)]
               _ (when debug (println m))
               _ (<! (timeout dt))]
           (recur (inc i) (conj r m)))
         (not tr) ;; hit limit, no result
-        [r task-chan]
+        [r result-chan]
         :else ;; ready!
         [r tr]))))
 
